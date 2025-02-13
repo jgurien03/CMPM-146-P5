@@ -1,444 +1,778 @@
-import copy
-import heapq
-import metrics
-import multiprocessing.pool as mpool
-import os
 import random
-import shutil
-import time
-import math
+import numpy as np
+from typing import List, Tuple, Optional
+from metrics import metrics
 
-width = 200
-height = 16
-
-class Individual_Grid(object):
-    __slots__ = ["genome", "_fitness"]
-
-    def __init__(self, genome):
-        self.genome = copy.deepcopy(genome)
-        self._fitness = None
-
-    def calculate_fitness(self):
-        measurements = metrics.metrics(self.to_level())
-        coefficients = dict(
-            meaningfulJumpVariance=1.0,  
-            negativeSpace=0.6,           
-            pathPercentage=0.8,          
-            emptyPercentage=0.4,         
-            linearity=-0.5,              
-            solvability=4.0              
-        )
+class Individual_Grid:
+    def __init__(self, width=200, height=16):
+        self.width = width
+        self.height = height
+        self.genome = [['-' for x in range(width)] for y in range(height)]
+        self.fitness = None
         
-        level = self.to_level()
-        # Bonus for powerups and coins
-        powerup_count = sum(row.count('M') for row in level)
-        powerup_bonus = min(powerup_count * 0.5, 2.0)
+    def generate_children(self, other) -> List['Individual_Grid']:
+        # Single point crossover
+        child = Individual_Grid(self.width, self.height)
+        crossover_point = random.randint(0, self.width-1)
         
-        coin_count = sum(row.count('o') + row.count('?') for row in level)
-        coin_bonus = min(coin_count * 0.1, 1.5)
-        
-        # Penalize any accidental gaps in the ground row
-        gap_penalty = 0
-        ground_row = level[height-1]
-        gap_count = ground_row.count('-')
-        if gap_count > 10:
-            gap_penalty = (gap_count - 10) * 0.2
-        
-        self._fitness = (sum(coefficients[m] * measurements[m] for m in coefficients)
-                         + powerup_bonus + coin_bonus - gap_penalty)
-        return self
-
-    def fitness(self):
-        if self._fitness is None:
-            self.calculate_fitness()
-        return self._fitness
-
-    # This instance method defers to the static mutation operator.
-    def mutate(self, genome):
-        return Individual_Grid.mutate_static(genome)
-
-    @staticmethod
-    def mutate_static(genome):
-        left = 1
-        right = width - 1
-
-        # --- Enforce the Ground Row ---
-        for x in range(left, right):
-            genome[height-1][x] = "X"
-
-        # --- Feature Probabilities ---
-        p_pipe = 0.008  # Pipe probability
-        p_block = 0.06  # Bblock probability
-        p_coin = 0.08   # Coin probability
-
-        # Track feature positions
-        pipe_positions = []     # Store (x_pos, height) tuples for pipes
-        item_block_positions = [] # Store x positions of item blocks
-        enemy_positions = []    # Store x positions of enemies
-
-        # --- First Pass: Place Pipes ---
-        # Start after a safe distance from Mario
-        x = left + 12  # Increased starting gap
-        min_pipe_spacing = 8   # Increased minimum pipe spacing
-        
-        while x < right - 8:
-            if random.random() < p_pipe:
-                # Strict pipe spacing check
-                if not pipe_positions or (x - pipe_positions[-1][0] >= min_pipe_spacing):
-                    pipe_height = random.randint(2, 4)
-                    pipe_positions.append((x, pipe_height))
-                    # Place the pipe
-                    top_row = (height - 1) - pipe_height
-                    genome[top_row][x] = "T"
-                    for py in range(top_row + 1, height - 1):
-                        genome[py][x] = "|"
-                    x += min_pipe_spacing  # Force minimum spacing
-                    continue
-            x += 1
-
-        # --- Second Pass: Place Blocks and Coins ---
-        min_block_spacing = 4  # Minimum spaces between item blocks
-        last_block_x = left
-
-        for x in range(left + 6, right - 5):
-            # Check if this column has a pipe or is too close to one
-            is_near_pipe = any(abs(x - pipe_pos[0]) <= 2 for pipe_pos in pipe_positions)
-            
-            if not is_near_pipe:  # Only place blocks if not near a pipe
-                # Place item blocks with minimum spacing
-                if random.random() < p_block and (x - last_block_x >= min_block_spacing):
-                    y_pos = random.randint(height-7, height-3)
-                    if genome[y_pos][x] == "-":
-                        block_type = random.choice(["?", "B", "M"])
-                        genome[y_pos][x] = block_type
-                        item_block_positions.append(x)
-                        last_block_x = x
-
-                # Place coins with consideration for blocks
-                if random.random() < p_coin and (x not in item_block_positions):
-                    y_pos = random.randint(height-8, height-4)
-                    if genome[y_pos][x] == "-":
-                        genome[y_pos][x] = "o"
-
-        # --- Third Pass: Place Enemies (Goombas) ---
-        # Define segments between pipes for enemy placement
-        segments = []
-        last_x = left
-        for pipe_pos in pipe_positions:
-            if pipe_pos[0] - last_x > 1:
-                segments.append((last_x, pipe_pos[0] - 1))
-            last_x = pipe_pos[0] + 1
-        
-        if right - last_x > 1:
-            segments.append((last_x, right - 1))
-
-        # Place enemies in segments with strict control
-        for seg_start, seg_end in segments:
-            seg_width = seg_end - seg_start + 1
-            
-            # Special handling for starting segment
-            if seg_start == left:
-                # Maximum 2 enemies in starting area
-                num_enemies = min(2, seg_width // 8)
-            else:
-                # For other segments, keep very sparse
-                if seg_width >= 16:
-                    num_enemies = 2
-                elif seg_width >= 8:
-                    num_enemies = 1
+        for y in range(self.height):
+            for x in range(self.width):
+                if x < crossover_point:
+                    child.genome[y][x] = self.genome[y][x]
                 else:
-                    num_enemies = 0
+                    child.genome[y][x] = other.genome[y][x]
+        
+        return [child]
 
-            # Place enemies with strict spacing rules
-            valid_positions = list(range(seg_start + 3, seg_end - 2))
-            random.shuffle(valid_positions)
-            
-            min_enemy_spacing = 4  # Minimum blocks between enemies
-            placed_enemies = 0
-            
-            for pos in valid_positions:
-                if placed_enemies >= num_enemies:
-                    break
+    def mutate(self) -> None:
+        """Apply random mutations to the genome with improved constraints"""
+        mutation_rate = 0.05
+        MIN_JUMP_HEIGHT = 3
+        MAX_JUMP_HEIGHT = 6
+        
+        for x in range(2, self.width-2):  # Don't modify edges
+            if random.random() < mutation_rate:
+                # Randomly select a vertical position
+                y = random.randint(self.height-MAX_JUMP_HEIGHT, self.height-MIN_JUMP_HEIGHT)
+                
+                # Only modify if space is empty and surroundings are clear
+                if (self.genome[y][x] == '-' and 
+                    all(self.genome[y+dy][x] == '-' for dy in [-1, 1] if 0 <= y+dy < self.height)):
                     
-                # Check if position is valid (not too close to other enemies or item blocks)
-                if (all(abs(pos - e_pos) >= min_enemy_spacing for e_pos in enemy_positions) and
-                    all(abs(pos - b_pos) >= 2 for b_pos in item_block_positions)):
-                    if genome[height-2][pos] == "-":
-                        genome[height-2][pos] = "E"
-                        enemy_positions.append(pos)
-                        placed_enemies += 1
-
-        return genome
-
-    def generate_children(self, other):
-        new_genome = copy.deepcopy(self.genome)
-        left = 1
-        right = width - 1
-        # Column-based crossover using two crossover points.
-        crossover_points = sorted([random.randint(left+5, right-5) for _ in range(2)])
-        for y in range(height):
-            for x in range(left, right):
-                if x < crossover_points[0] or x >= crossover_points[1]:
-                    new_genome[y][x] = self.genome[y][x]
-                else:
-                    new_genome[y][x] = other.genome[y][x]
-                # Make sure that an enemy on row height-2 is only kept if the ground in that column is solid.
-                if y == height - 2 and new_genome[y][x] == "E" and new_genome[height-1][x] != "X":
-                    new_genome[y][x] = "-"
-        # Apply mutation to the child.
-        new_genome = self.mutate(new_genome)
-        return (Individual_Grid(new_genome),)
-
-    def to_level(self):
-        return self.genome
-
-    @classmethod
-    def empty_individual(cls):
-        # Build an empty level: air everywhere, then enforce the ground row.
-        g = [["-" for col in range(width)] for row in range(height)]
-        g[height-1] = ["X"] * width
-        # Place fixed markers (Mario's start, flag, etc.)
-        g[height-2][0] = "m"
-        g[7][-1] = "v"
-        for row in range(8, 14):
-            g[row][-1] = "f"
-        for row in range(14, height):
-            g[row][-1] = "X"
-        return cls(g)
-
-    @classmethod
-    def random_individual(cls):
-        # Start from an empty level and then decorate it with features.
-        ind = cls.empty_individual()
-        new_genome = copy.deepcopy(ind.genome)
-        new_genome = cls.mutate_static(new_genome)
-        return cls(new_genome)
-
-
-def offset_by_upto(val, variance, min=None, max=None):
-    val += random.normalvariate(0, variance**0.5)
-    if min is not None and val < min:
-        val = min
-    if max is not None and val > max:
-        val = max
-    return int(val)
-
-
-def clip(lo, val, hi):
-    if val < lo:
-        return lo
-    if val > hi:
-        return hi
-    return val
-
-
-class Individual_DE(object):
-    __slots__ = ["genome", "_fitness", "_level"]
-
-    def __init__(self, genome):
-        self.genome = list(genome)
-        heapq.heapify(self.genome)
-        self._fitness = None
-        self._level = None
-
-    def calculate_fitness(self):
-        measurements = metrics.metrics(self.to_level())
-        coefficients = dict(
-            meaningfulJumpVariance=0.5,
-            negativeSpace=0.6,
-            pathPercentage=0.5,
-            emptyPercentage=0.6,
-            linearity=-0.5,
-            solvability=2.0
-        )
-        penalties = 0
-        if len(list(filter(lambda de: de[1] == "6_stairs", self.genome))) > 5:
-            penalties -= 2
-        self._fitness = sum(coefficients[m] * measurements[m] for m in coefficients) + penalties
-        return self
-
-    def fitness(self):
-        if self._fitness is None:
-            self.calculate_fitness()
-        return self._fitness
-
-    def mutate(self, genome):
-        left = 1
-        right = width - 1
-        
-        for y in range(height):
-            for x in range(left, right):
-                if random.random() < 0.1:
-                    if y > height - 4:
-                        genome[y][x] = random.choice(["X", "B", "?", "-"])
-                    elif y > height - 8:
-                        genome[y][x] = random.choice(["X", "B", "?", "o", "-", "-", "-"])
+                    # Different probabilities for different elements
+                    element = random.choices(
+                        ['-', '?', 'B', 'o', 'E'],
+                        weights=[0.6, 0.15, 0.1, 0.1, 0.05]
+                    )[0]
+                    
+                    # Special handling for enemies
+                    if element == 'E':
+                        # Only place on ground and with spacing
+                        if (self.genome[self.height-1][x] == 'X' and 
+                            all(self.genome[self.height-2][x+dx] != 'E' 
+                                for dx in range(-3, 4) if 0 <= x+dx < self.width)):
+                            self.genome[self.height-2][x] = 'E'
                     else:
-                        genome[y][x] = random.choice(["o", "-", "-", "-", "-"])
-                    if genome[y][x] in ["X", "B", "?"]:
-                        if y < height - 1 and genome[y+1][x] == "-":
-                            genome[y+1][x] = "X"
-                    if y == height - 1 and genome[y][x] == "-":
-                        gap_width = random.randint(2, 4)
-                        for i in range(gap_width):
-                            if x + i < right:
-                                genome[y][x+i] = "-"
-        return genome
+                        self.genome[y][x] = element
+                            
+        # Maintain Mario and flag positions
+        self.genome[self.height-2][1] = 'm'  # Mario
+        
+        # Maintain flagpole
+        flag_x = self.width-2
+        flag_height = 5
+        for y in range(self.height-2, self.height-flag_height-1, -1):
+            self.genome[y][flag_x] = 'f'
+        self.genome[self.height-flag_height-1][flag_x] = 'v'
 
-    def generate_children(self, other):
-        pa = random.randint(0, len(self.genome) - 1)
-        pb = random.randint(0, len(other.genome) - 1)
-        a_part = self.genome[:pa] if len(self.genome) > 0 else []
-        b_part = other.genome[pb:] if len(other.genome) > 0 else []
-        ga = a_part + b_part
-        b_part = other.genome[:pb] if len(other.genome) > 0 else []
-        a_part = self.genome[pa:] if len(self.genome) > 0 else []
-        gb = b_part + a_part
-        return Individual_DE(self.mutate(ga)), Individual_DE(self.mutate(gb))
+    def _apply_constrained_mutation(self, x: int, y: int) -> None:
+        ground_level = self.height - 1
 
-    def to_level(self):
-        if self._level is None:
-            base = Individual_Grid.empty_individual().to_level()
-            for de in sorted(self.genome, key=lambda de: (de[1], de[0], de)):
-                x = de[0]
-                de_type = de[1]
-                if de_type == "4_block":
-                    y = de[2]
-                    breakable = de[3]
-                    base[y][x] = "B" if breakable else "X"
-                elif de_type == "5_qblock":
-                    y = de[2]
-                    has_powerup = de[3]
-                    base[y][x] = "M" if has_powerup else "?"
-                elif de_type == "3_coin":
-                    y = de[2]
-                    base[y][x] = "o"
-                elif de_type == "7_pipe":
-                    h = de[2]
-                    base[height - h - 1][x] = "T"
-                    for y in range(height - h, height):
-                        base[y][x] = "|"
-                elif de_type == "0_hole":
-                    w = de[2]
-                    for x2 in range(w):
-                        base[height - 1][clip(1, x + x2, width - 2)] = "-"
-                elif de_type == "6_stairs":
-                    h = de[2]
-                    dx = de[3]
-                    for x2 in range(1, h + 1):
-                        for y in range(x2 if dx == 1 else h - x2):
-                            base[clip(0, height - y - 1, height - 1)][clip(1, x + x2, width - 2)] = "X"
-                elif de_type == "1_platform":
-                    w = de[2]
-                    h = de[3]
-                    madeof = de[4]
-                    for x2 in range(w):
-                        base[clip(0, height - h - 1, height - 1)][clip(1, x + x2, width - 2)] = madeof
-                elif de_type == "2_enemy":
-                    base[height - 2][x] = "E"
-            self._level = base
-        return self._level
+        if y == ground_level:
+            self.genome[y][x] = random.choice(['X', '|'])
+            if self.genome[y][x] == '|':
+                self._validate_pipe_placement(x, y)
+        elif y > ground_level - 4:  
+            if self._is_between_pipes(x):
+                if self._count_goombas_between_pipes(x) < 3:
+                    self.genome[y][x] = 'E'
+        else:  
+            self.genome[y][x] = random.choice(['-', '?', 'B', 'o'])
+            
+    def _validate_pipe_placement(self, x: int, y: int) -> None:
+        min_pipe_distance = 5
+        for dx in range(-min_pipe_distance, min_pipe_distance + 1):
+            check_x = x + dx
+            if 0 <= check_x < self.width and check_x != x:
+                if self.genome[y][check_x] == '|':
+                    self.genome[y][x] = 'X'
+                    return
+                    
+    def _is_between_pipes(self, x: int) -> bool:
+        left_pipe = right_pipe = None
+        for dx in range(x-1, -1, -1):
+            if self.genome[self.height-1][dx] == '|':
+                left_pipe = dx
+                break
+        for dx in range(x+1, self.width):
+            if self.genome[self.height-1][dx] == '|':
+                right_pipe = dx
+                break
+        return left_pipe is not None and right_pipe is not None
 
-    @classmethod
-    def empty_individual(_cls):
-        g = []
-        return Individual_DE(g)
+    def _count_goombas_between_pipes(self, x: int) -> int:
+        count = 0
+        left_x = right_x = x
+        while left_x > 0 and self.genome[self.height-1][left_x] != '|':
+            left_x -= 1
+        while right_x < self.width and self.genome[self.height-1][right_x] != '|':
+            right_x += 1
+            
+        for check_x in range(left_x, right_x):
+            for y in range(self.height):
+                if self.genome[y][check_x] == 'E':
+                    count += 1
+        return count
 
-    @classmethod
-    def random_individual(_cls):
-        elt_count = random.randint(8, 128)
-        g = [random.choice([
-            (random.randint(1, width - 2), "0_hole", random.randint(1, 8)),
-            (random.randint(1, width - 2), "1_platform", random.randint(1, 8), random.randint(0, height - 1), random.choice(["?", "X", "B"])),
-            (random.randint(1, width - 2), "2_enemy"),
-            (random.randint(1, width - 2), "3_coin", random.randint(0, height - 1)),
-            (random.randint(1, width - 2), "4_block", random.randint(0, height - 1), random.choice([True, False])),
-            (random.randint(1, width - 2), "5_qblock", random.randint(0, height - 1), random.choice([True, False])),
-            (random.randint(1, width - 2), "6_stairs", random.randint(1, height - 4), random.choice([-1, 1])),
-            (random.randint(1, width - 2), "7_pipe", random.randint(2, height - 4))
-        ]) for i in range(elt_count)]
-        return Individual_DE(g)
+    def calculate_fitness(self) -> float:
+        """Calculate fitness with improved metrics"""
+        level_lines = self.to_level()
+        level_metrics = metrics(level_lines)
+        
+        if not level_metrics['solvability']:
+            return 0.0
+            
+        fitness = 0.0
+        
+        # Basic metrics with adjusted weights
+        fitness += level_metrics['pathPercentage'] * 4.0
+        fitness += level_metrics['decorationPercentage'] * 2.0
+        fitness += level_metrics['negativeSpace'] * 1.5
+        
+        # Reward meaningful jumps
+        fitness += level_metrics['meaningfulJumps'] * 2.0
+        
+        # Penalize extreme linearity but not too harshly
+        if level_metrics['linearity'] > 0.8:
+            fitness -= (level_metrics['linearity'] - 0.8) * 1.5
+        
+        # Add bonus for good decoration balance
+        if 0.2 <= level_metrics['decorationPercentage'] <= 0.4:
+            fitness += 2.0
+        
+        # Ensure non-negative fitness
+        return max(0.0, fitness)
 
-Individual = Individual_Grid
+    def _check_pipe_constraints(self) -> int:
+        violations = 0
+        last_pipe_x = -float('inf')
+        
+        for x in range(self.width):
+            if self.genome[self.height-1][x] == '|':
+                if x - last_pipe_x < 5:  # Min pipe distance
+                    violations += 1
+                last_pipe_x = x
+                
+                # Check for floating pipes
+                if any(self.genome[y][x] == '|' for y in range(self.height-1)):
+                    violations += 1
+                    
+        return violations
 
-def generate_successors(population):
-    results = []
-    # Sort by fitness (highest first)
-    population = sorted(population, key=lambda x: x.fitness(), reverse=True)
-    elite_count = int(len(population) * 0.1)
-    results.extend(population[:elite_count])
-    while len(results) < len(population):
-        parent1 = random.choice(population[:len(population)//2])
-        parent2 = random.choice(population[:len(population)//2])
+    def _check_goomba_constraints(self) -> int:
+        violations = 0
+        current_goombas = 0
+        in_pipe_section = False
+        
+        for x in range(self.width):
+            if self.genome[self.height-1][x] == '|':
+                if current_goombas > 3:
+                    violations += current_goombas - 3
+                current_goombas = 0
+                in_pipe_section = True
+            elif in_pipe_section:
+                if any(self.genome[y][x] == 'E' for y in range(self.height)):
+                    current_goombas += 1
+                    
+        return violations
+
+    def _check_block_constraints(self) -> int:
+        violations = 0
+        
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.genome[y][x] in ['?', 'B']:
+                    # Check for ground contact
+                    if y == self.height - 1:
+                        violations += 1
+                    # Check for adjacency to pipes
+                    if any(self.genome[y+dy][x+dx] == '|' 
+                          for dy, dx in [(-1,0), (1,0), (0,-1), (0,1)]
+                          if 0 <= y+dy < self.height and 0 <= x+dx < self.width):
+                        violations += 1
+                        
+        return violations
+
+    def _has_unreachable_blocks(self) -> bool:
+        """Check for unreachable blocks"""
+        MAX_JUMP_HEIGHT = 4
+        for x in range(self.width):
+            lowest_block = -1
+            for y in range(self.height-1):
+                if self.genome[y][x] in ['?', 'B', 'o']:
+                    if lowest_block == -1:
+                        lowest_block = y
+                    if y < self.height-MAX_JUMP_HEIGHT-1:  # Too high
+                        return True
+        return False
+
+    def _has_invalid_pipe_placement(self) -> bool:
+        """Check for invalid pipe placement"""
+        for x in range(self.width):
+            for y in range(self.height-1):
+                if self.genome[y][x] == '|':
+                    # Check if pipe has ground support
+                    if y < self.height-1 and self.genome[y+1][x] not in ['|', 'X']:
+                        return True
+                    # Check if pipe top is properly placed
+                    if self.genome[y][x] == 'T' and y > 0 and self.genome[y-1][x] != '-':
+                        return True
+        return False
+
+    def to_level(self) -> List[str]:
+        """Convert genome to level string format as list of lines"""
+        lines = []
+        for y in range(self.height):
+            # Ensure each line is exactly width characters long
+            line = ''.join(self.genome[y][:self.width])  # Truncate if too long
+            line = line.ljust(self.width, '-')  # Pad with empty space if too short
+            lines.append(line)
+        return lines
+
+    def to_level_string(self) -> str:
+        """Convert genome to single string format for file saving"""
+        lines = self.to_level()
+        return '\n'.join(lines) + '\n'  # Add final newline for Unity compatibility
+
+    def from_level(self, level_str: str) -> None:
+        """Load genome from level string format"""
+        self.genome = [list(row) for row in level_str.split('\n')]
+        self.height = len(self.genome)
+        self.width = len(self.genome[0])
+
+class Individual_DE:
+    def __init__(self, width=200, height=16):
+        self.width = width
+        self.height = height
+        self.genome = []  # List of design elements
+        self.fitness = None
+        
+    def generate_children(self, other) -> List['Individual_DE']:
+        child = Individual_DE(self.width, self.height)
+        
+        # Variable point crossover
+        crossover_points = sorted(random.sample(
+            range(min(len(self.genome), len(other.genome))), 
+            random.randint(1, 3)
+        ))
+        
+        current_parent = self
+        current_point = 0
+        
+        for point in crossover_points:
+            child.genome.extend(current_parent.genome[current_point:point])
+            current_point = point
+            current_parent = other if current_parent == self else self
+            
+        child.genome.extend(current_parent.genome[current_point:])
+        
+        return [child]
+
+    def mutate(self) -> None:
+        # Element addition/removal
+        if random.random() < 0.3:
+            if random.random() < 0.5 and self.genome:
+                # Remove random element
+                del self.genome[random.randrange(len(self.genome))]
+            else:
+                # Add new random element
+                self.genome.append(self._generate_random_element())
+                
+        # Element modification
+        for element in self.genome:
+            if random.random() < 0.1:
+                self._mutate_element(element)
+
+    def _generate_random_element(self) -> dict:
+        element_type = random.choice(['hole', 'platform', 'enemy', 'coin', 'block', 'pipe', 'stairs'])
+        
+        if element_type == 'hole':
+            return {
+                'type': 'hole',
+                'width': random.randint(2, 4),
+                'x': random.randint(0, self.width-4)
+            }
+        elif element_type == 'platform':
+            return {
+                'type': 'platform',
+                'width': random.randint(2, 6),
+                'height': random.randint(3, self.height-4),
+                'x': random.randint(0, self.width-6),
+                'block_type': random.choice(['?', 'X', 'B'])
+            }
+        elif element_type == 'enemy':
+            return {
+                'type': 'enemy',
+                'x': random.randint(0, self.width-1)
+            }
+        elif element_type == 'coin':
+            return {
+                'type': 'coin',
+                'x': random.randint(0, self.width-1),
+                'height': random.randint(2, self.height-4)
+            }
+        elif element_type == 'block':
+            return {
+                'type': 'block',
+                'x': random.randint(0, self.width-1),
+                'height': random.randint(2, self.height-4),
+                'breakable': random.choice([True, False])
+            }
+        elif element_type == 'pipe':
+            return {
+                'type': 'pipe',
+                'x': random.randint(0, self.width-1),
+                'height': random.randint(2, 4)
+            }
+        else:  # stairs
+            return {
+                'type': 'stairs',
+                'x': random.randint(0, self.width-4),
+                'height': random.randint(2, 4),
+                'direction': random.choice([-1, 1])
+            }
+
+    def _mutate_element(self, element: dict) -> None:
+        """Modify element properties within constraints"""
+        if element['type'] == 'hole':
+            element['width'] = max(2, min(4, element['width'] + random.randint(-1, 1)))
+        elif element['type'] == 'platform':
+            element['width'] = max(2, min(6, element['width'] + random.randint(-1, 1)))
+            element['height'] = max(3, min(self.height-4, element['height'] + random.randint(-1, 1)))
+        elif element['type'] in ['coin', 'block']:
+            element['height'] = max(2, min(self.height-4, element['height'] + random.randint(-1, 1)))
+        elif element['type'] == 'pipe':
+            element['height'] = max(2, min(4, element['height'] + random.randint(-1, 1)))
+        elif element['type'] == 'stairs':
+            element['height'] = max(2, min(4, element['height'] + random.randint(-1, 1)))
+            if random.random() < 0.1:
+                element['direction'] *= -1
+
+    def calculate_fitness(self) -> float:
+        """Calculate fitness based on level metrics"""
+        # Get the level as a list of strings
+        level_lines = self.to_level()  # This now returns a list of strings
+        
+        # Calculate metrics
+        level_metrics = metrics(level_lines)  # metrics expects a list of strings
+        
+        if not level_metrics['solvability']:
+            return 0.0
+            
+        fitness = 0.0
+        
+        # Basic level design rewards
+        fitness += level_metrics['pathPercentage'] * 3.0
+        fitness += level_metrics['decorationPercentage'] * 2.0
+        fitness += level_metrics['negativeSpace'] * 1.5
+        
+        # Gameplay element rewards
+        fitness += level_metrics['meaningfulJumps'] * 0.5
+        fitness += min(level_metrics['jumps'], 10) * 0.3  # Cap jump rewards
+        
+        # Level flow penalties
+        if level_metrics['linearity'] > 0.8:  # Penalize too much linearity
+            fitness -= (level_metrics['linearity'] - 0.8) * 2.0
+            
+        return max(0.0, fitness)  # Ensure non-negative fitness
+
+    def _count_elements(self) -> dict:
+        counts = {'hole': 0, 'platform': 0, 'enemy': 0, 'coin': 0, 
+                 'block': 0, 'pipe': 0, 'stairs': 0}
+        for element in self.genome:
+            counts[element['type']] += 1
+        return counts
+
+    def to_level(self) -> str:
+        """Convert design elements to level string"""
+        # Initialize empty level
+        level = [['-' for x in range(self.width)] for y in range(self.height)]
+        
+        # Add ground
+        for x in range(self.width):
+            level[self.height-1][x] = 'X'
+            
+        # Apply design elements in order
+        for element in self.genome:
+            self._apply_element(level, element)
+            
+        return '\n'.join(''.join(row) for row in level)
+
+    def _apply_element(self, level: List[List[str]], element: dict) -> None:
+        """Apply a single design element to the level grid"""
+        x = element['x']
+        
+        if element['type'] == 'hole':
+            # Create holes in ground level, keeping track of minimum safety width
+            for hole_x in range(x, min(x + element['width'], self.width)):
+                if hole_x > 1 and hole_x < self.width - 2:  # Leave edges solid
+                    level[self.height-1][hole_x] = '-'
+                    
+        elif element['type'] == 'platform':
+            # Create platforms at specified height
+            y = element['height']
+            block_type = element['block_type']
+            for platform_x in range(x, min(x + element['width'], self.width)):
+                if 0 <= y < self.height - 1:  # Don't place at ground level
+                    level[y][platform_x] = block_type
+                    
+        elif element['type'] == 'enemy':
+            # Place enemy (Goomba) on ground if valid position
+            if level[self.height-1][x] == 'X':  # Only place on solid ground
+                # Check for nearby pipes to enforce goomba constraints
+                left_pipe = right_pipe = False
+                for dx in range(-3, 4):  # Check 3 blocks left and right
+                    check_x = x + dx
+                    if 0 <= check_x < self.width:
+                        if level[self.height-1][check_x] == '|':
+                            if dx < 0:
+                                left_pipe = True
+                            else:
+                                right_pipe = True
+                
+                # Only place if between pipes and not too many goombas
+                if left_pipe and right_pipe:
+                    goomba_count = 0
+                    for check_x in range(x-3, x+4):
+                        if 0 <= check_x < self.width:
+                            if level[self.height-2][check_x] == 'E':
+                                goomba_count += 1
+                    
+                    if goomba_count < 3:  # Maximum 3 goombas between pipes
+                        level[self.height-2][x] = 'E'
+                    
+        elif element['type'] == 'coin':
+            # Place floating coins, making sure they're not intersecting with other elements
+            y = element['height']
+            if 0 <= y < self.height - 1:  # Don't place at ground level
+                if level[y][x] == '-':  # Only place in empty space
+                    level[y][x] = 'o'
+                    
+        elif element['type'] == 'block':
+            # Place question or breakable blocks
+            y = element['height']
+            if 0 <= y < self.height - 1:  # Don't place at ground level
+                if level[y][x] == '-':  # Only place in empty space
+                    block_type = 'B' if element['breakable'] else '?'
+                    # Check for vertical spacing
+                    can_place = True
+                    for dy in [-1, 0, 1]:
+                        check_y = y + dy
+                        if 0 <= check_y < self.height:
+                            if level[check_y][x] not in ['-', 'o']:  # Allow overlap with coins
+                                can_place = False
+                                break
+                    if can_place:
+                        level[y][x] = block_type
+                    
+        elif element['type'] == 'pipe':
+            # Place pipes, ensuring proper spacing and ground contact
+            height = element['height']
+            if x < self.width - 1 and level[self.height-1][x] == 'X':  # Need space and ground
+                # Check for minimum pipe spacing
+                can_place = True
+                for dx in range(-4, 5):  # Check 4 blocks left and right
+                    check_x = x + dx
+                    if 0 <= check_x < self.width:
+                        if level[self.height-1][check_x] == '|':
+                            can_place = False
+                            break
+                            
+                if can_place:
+                    # Place pipe base
+                    level[self.height-1][x] = '|'
+                    level[self.height-1][x+1] = '|'
+                    # Place pipe body
+                    for y in range(self.height-2, self.height-height-1, -1):
+                        if y >= 0:
+                            level[y][x] = '|'
+                            level[y][x+1] = '|'
+                    # Place pipe top
+                    if self.height-height-1 >= 0:
+                        level[self.height-height-1][x] = 'T'
+                        level[self.height-height-1][x+1] = 'T'
+                        
+        elif element['type'] == 'stairs':
+            # Create ascending/descending stairs
+            height = element['height']
+            direction = element['direction']
+            for h in range(height):
+                stair_x = x + (h * direction)
+                if 0 <= stair_x < self.width:
+                    # Build stairs from ground up
+                    for y in range(self.height-1, self.height-h-2, -1):
+                        if y >= 0:
+                            level[y][stair_x] = 'X'
+
+def generate_successors(population: List[Individual_Grid], num_children: int) -> List[Individual_Grid]:
+    """Implement both tournament and roulette wheel selection"""
+    successors = []
+    
+    # Tournament selection
+    tournament_size = 5
+    for _ in range(num_children // 2):
+        parent1 = _tournament_select(population, tournament_size)
+        parent2 = _tournament_select(population, tournament_size)
+        
         children = parent1.generate_children(parent2)
-        results.extend(children)
-    return results
+        for child in children:
+            child.mutate()
+            successors.append(child)
+            
+    # Roulette wheel selection
+    total_fitness = sum(ind.fitness for ind in population)
+    for _ in range(num_children - len(successors)):
+        parent1 = _roulette_select(population, total_fitness)
+        parent2 = _roulette_select(population, total_fitness)
+        
+        children = parent1.generate_children(parent2)
+        for child in children:
+            child.mutate()
+            successors.append(child)
+            
+    return successors
+
+def _tournament_select(population: List[Individual_Grid], 
+                    tournament_size: int) -> Individual_Grid:
+    """Select individual through tournament selection"""
+    tournament = random.sample(population, tournament_size)
+    return max(tournament, key=lambda ind: ind.fitness)
+
+def _roulette_select(population: List[Individual_Grid], 
+                    total_fitness: float) -> Individual_Grid:
+    """Select individual through roulette wheel selection"""
+    r = random.uniform(0, total_fitness)
+    current_sum = 0
+    for ind in population:
+        current_sum += ind.fitness
+        if current_sum > r:
+            return ind
+    return population[-1]  # Fallback
+
+def to_level(self) -> List[str]:
+    """Convert genome to level string format as list of lines"""
+    lines = []
+    for y in range(self.height):
+        # Ensure each line is exactly width characters long
+        line = ''.join(self.genome[y][:self.width])  # Truncate if too long
+        line = line.ljust(self.width, '-')  # Pad with empty space if too short
+        lines.append(line)
+    return lines
+
+def to_level_string(self) -> str:
+    """Convert genome to single string format for file saving"""
+    lines = self.to_level()
+    return '\n'.join(lines) + '\n'  # Add final newline for Unity compatibility
 
 def ga():
-    pop_limit = 480
-    batches = os.cpu_count()
-    if pop_limit % batches != 0:
-        print("It's ideal if pop_limit divides evenly into " + str(batches) + " batches.")
-    batch_size = int(math.ceil(pop_limit / batches))
-    with mpool.Pool(processes=os.cpu_count()) as pool:
-        init_time = time.time()
-        population = [Individual.random_individual() if random.random() < 0.9
-                      else Individual.empty_individual()
-                      for _ in range(pop_limit)]
-        population = pool.map(Individual.calculate_fitness, population, batch_size)
-        init_done = time.time()
-        print("Created and calculated initial population statistics in:", init_done - init_time, "seconds")
-        generation = 0
-        start = time.time()
-        best_fitness_history = []  # Track best fitness per generation for our new break condition.
-        print("Use ctrl-c to terminate this loop manually.")
+    """Main genetic algorithm loop"""
+    population_size = 100
+    num_generations = 50
+    population = []
+    
+    # Variables for early stopping
+    best_fitness = float('-inf')
+    generations_without_improvement = 0
+    max_generations_without_improvement = 10
+    
+    # Initialize population
+    for _ in range(population_size):
+        if random.random() < 0.7:
+            ind = random_individual()
+        else:
+            ind = empty_individual()
+        population.append(ind)
+    
+    # Evolution loop
+    try:
+        for generation in range(num_generations):
+            # Calculate fitness
+            for ind in population:
+                if ind.fitness is None:
+                    ind.fitness = ind.calculate_fitness()
+            
+            # Sort population
+            population.sort(key=lambda ind: ind.fitness or 0.0, reverse=True)
+            
+            # Check for improvement
+            current_best_fitness = population[0].fitness
+            if current_best_fitness > best_fitness:
+                best_fitness = current_best_fitness
+                generations_without_improvement = 0
+                print(f"Generation {generation}: New Best Fitness = {best_fitness}")
+            else:
+                generations_without_improvement += 1
+                print(f"Generation {generation}: Best Fitness = {current_best_fitness} (No improvement for {generations_without_improvement} generations)")
+            
+            # Early stopping check
+            if generations_without_improvement >= max_generations_without_improvement:
+                print(f"Stopping early: No improvement for {max_generations_without_improvement} generations")
+                break
+            
+            # Generate next population
+            next_population = []
+            
+            # Elitism
+            elitism_count = population_size // 10
+            next_population.extend(population[:elitism_count])
+            
+            # Generate remaining through selection/crossover/mutation
+            children = generate_successors(population, population_size - elitism_count)
+            next_population.extend(children)
+            
+            population = next_population
+            
+            # Save best level
+            with open("levels/last.txt", "w") as f:
+                f.write(population[0].to_level_string())
+            
+            # Save samples
+            if generation % 10 == 0:
+                for i, ind in enumerate(population[:5]):
+                    with open(f"levels/gen{generation}_sample{i}.txt", "w") as f:
+                        f.write(ind.to_level_string())
+                        
+    except Exception as e:
+        print(f"Error during evolution: {str(e)}")
+        raise
         
-        max_generations = 50
-        max_stagnant_generations = 10
-        
-        try:
-            while True:
-                now = time.time()
-                best = max(population, key=Individual.fitness)
-                current_fitness = best.fitness()
-                print("Generation:", generation)
-                print("Max fitness:", current_fitness)
-                print("Average generation time:", (now - start) / (generation + 1))
-                print("Net time:", now - start)
-                
-                # Update our best fitness history.
-                best_fitness_history.append(current_fitness)
-                if len(best_fitness_history) > 10:
-                    # Check if improvement over the past 10 generations is less than threshold.
-                    if best_fitness_history[-1] - best_fitness_history[0] < 1.0:
-                        print("Breaking: Insufficient improvement over the last 10 generations.")
-                        break
-                    # Keep the history window limited to 10 generations.
-                    best_fitness_history.pop(0)
-                
-                generation += 1
-                
-                if generation >= max_generations:
-                    print("Stopping: Max generations reached.")
-                    break
-                
-                next_population = generate_successors(population)
-                gentime = time.time()
-                next_population = pool.map(Individual.calculate_fitness, next_population, batch_size)
-                popdone = time.time()
-                print("Generated successors in:", gentime - now, "seconds")
-                print("Calculated fitnesses in:", popdone - gentime, "seconds")
-                population = next_population
-        except KeyboardInterrupt:
-            pass
-    return population
+    return population[0]
 
-if __name__ == "__main__":
-    final_gen = sorted(ga(), key=Individual.fitness, reverse=True)
-    best = final_gen[0]
-    print("Best fitness: " + str(best.fitness()))
-    now = time.strftime("%m_%d_%H_%M_%S")
-    for k in range(10):
-        with open("levels/" + now + "_" + str(k) + ".txt", 'w') as f:
-            for row in final_gen[k].to_level():
-                f.write("".join(row) + "\n")
+def random_individual() -> Individual_Grid:
+    ind = Individual_Grid()
+    # Initialize with empty spaces
+    ind.genome = [['-' for x in range(ind.width)] for y in range(ind.height)]
+    
+    # Add solid ground
+    for x in range(ind.width):
+        ind.genome[ind.height-1][x] = 'X'
+    
+    # Constants for better level design
+    MIN_JUMP_HEIGHT = 3
+    MAX_JUMP_HEIGHT = 6
+    BLOCK_SPAWN_CHANCE = 0.04
+    PIPE_SPAWN_CHANCE = 0.08
+    ENEMY_SPAWN_CHANCE = 0.02
+    MIN_PIPE_SPACING = 8
+    MIN_ENEMY_SPACING = 5
+    FLAGPOLE_SAFETY_ZONE = 10
+    
+    # First, place all pipes to establish boundaries for other elements
+    pipe_positions = []
+    x = 5  # Start after initial area
+    while x < ind.width - FLAGPOLE_SAFETY_ZONE:
+        if random.random() < PIPE_SPAWN_CHANCE and (not pipe_positions or x - pipe_positions[-1] >= MIN_PIPE_SPACING):
+            pipe_height = random.randint(2, 3)
+            # Place single pipe, starting one tile ABOVE ground
+            for y in range(ind.height-2, ind.height-pipe_height-2, -1):
+                ind.genome[y][x] = '|'
+            # Add pipe top
+            ind.genome[ind.height-pipe_height-2][x] = 'T'
+            pipe_positions.append(x)
+            x += MIN_PIPE_SPACING
+        else:
+            x += 1
+    
+    # Place blocks between pipes
+    last_block_type = None
+    last_block_x = 0
+    
+    for i in range(len(pipe_positions) + 1):
+        start_x = 2 if i == 0 else pipe_positions[i-1] + 2
+        if i == len(pipe_positions):
+            end_x = ind.width - FLAGPOLE_SAFETY_ZONE
+        else:
+            end_x = pipe_positions[i] - 2
+        
+        for x in range(start_x, end_x):
+            if random.random() < BLOCK_SPAWN_CHANCE:
+                if x >= ind.width - FLAGPOLE_SAFETY_ZONE:
+                    continue
+                
+                block_y = ind.height - random.randint(MIN_JUMP_HEIGHT, MAX_JUMP_HEIGHT)
+                
+                if ind.genome[block_y][x] == '-':
+                    if (block_y > 0 and block_y < ind.height-1 and 
+                        all(ind.genome[y][x] == '-' for y in [block_y-1, block_y+1])):
+                        
+                        available_types = ['?', 'B', 'o']
+                        if last_block_type == 'B' and x - last_block_x < 3:
+                            available_types.remove('B')
+                        elif last_block_type == '?' and x - last_block_x < 3:
+                            available_types.remove('?')
+                        
+                        block_type = random.choices(
+                            available_types,
+                            weights=[0.5, 0.3, 0.2][:len(available_types)]
+                        )[0]
+                        
+                        ind.genome[block_y][x] = block_type
+                        last_block_type = block_type
+                        last_block_x = x
+    
+    # Place enemies with safe zone check
+    last_enemy_x = 0
+    enemy_limit = ind.width - FLAGPOLE_SAFETY_ZONE  # Define safe zone boundary
+    if pipe_positions:  # If we have pipes, use the last pipe as boundary
+        enemy_limit = min(enemy_limit, pipe_positions[-1])
+    
+    for x in range(2, enemy_limit):
+        if (x - last_enemy_x > MIN_ENEMY_SPACING and 
+            random.random() < ENEMY_SPAWN_CHANCE and 
+            ind.genome[ind.height-1][x] == 'X' and
+            x not in pipe_positions):
+            
+            clear_area = True
+            for dx in [-1, 0, 1]:
+                check_x = x + dx
+                if 0 <= check_x < ind.width:
+                    if ind.genome[ind.height-2][check_x] != '-':
+                        clear_area = False
+                        break
+            
+            if clear_area:
+                ind.genome[ind.height-2][x] = 'E'
+                last_enemy_x = x
+    
+    # Add Mario at start
+    ind.genome[ind.height-2][1] = 'm'
+    
+    # Add flagpole
+    flag_x = ind.width-2
+    flag_height = 5
+    
+    # Add pole
+    for y in range(ind.height-2, ind.height-flag_height-1, -1):
+        ind.genome[y][flag_x] = 'f'
+    
+    # Add top
+    ind.genome[ind.height-flag_height-1][flag_x] = 'v'
+    
+    return ind
+    
+def empty_individual() -> Individual_Grid:
+    """Create an empty individual with just ground"""
+    ind = Individual_Grid()
+    
+    # Initialize with empty spaces
+    ind.genome = [['-' for x in range(ind.width)] for y in range(ind.height)]
+    
+    # Add solid ground
+    for x in range(ind.width):
+        ind.genome[ind.height-1][x] = 'X'
+    
+    # Add Mario's start position
+    ind.genome[ind.height-2][1] = 'm'
+    
+    # Add goal
+    ind.genome[ind.height-1][ind.width-2] = 'X'  # Ground under flag
+    ind.genome[ind.height-2][ind.width-2] = 'v'  # Flagpole
+    for y in range(ind.height-3, -1, -1):  # Flag
+        ind.genome[y][ind.width-2] = 'f'
+    
+    return ind
+
+if __name__ == '__main__':
+    print("Starting genetic algorithm...")
+    best = ga()
+    print(f"Final Best Fitness: {best.fitness}")
